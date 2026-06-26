@@ -10,6 +10,56 @@ use tpm_types::TpmQuote;
 
 pub const ATTESTATION_VERSION: u64 = 1;
 
+pub(crate) fn strip_tdx_runtime_event_log(event_log: Vec<TdxEvent>) -> Vec<TdxEvent> {
+    event_log
+        .into_iter()
+        .filter(|event| event.imr == 3)
+        .map(|event| event.stripped())
+        .collect()
+}
+
+pub(crate) fn strip_tdx_measurement_event_log(event_log: Vec<TdxEvent>) -> Vec<TdxEvent> {
+    let rtmr0_count = event_log.iter().filter(|event| event.imr == 0).count();
+    let acpi_indexes = if rtmr0_count >= 17 {
+        [10usize, 11, 12]
+    } else {
+        [8usize, 9, 10]
+    };
+    let mut rtmr0_index = 0usize;
+
+    event_log
+        .into_iter()
+        .filter_map(|event| {
+            if event.imr == 0 {
+                let keep = acpi_indexes.contains(&rtmr0_index);
+                rtmr0_index += 1;
+                keep.then(|| event.stripped())
+            } else if event.imr == 3 {
+                Some(event.stripped())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn is_tdx_measurement_config(config: &str) -> bool {
+    serde_json::from_str::<dstack_types::VmConfig>(config)
+        .map(|config| config.tdx_attestation_variant.is_measurement())
+        .unwrap_or(false)
+}
+
+pub(crate) fn strip_tdx_event_log_for_config(
+    event_log: Vec<TdxEvent>,
+    config: &str,
+) -> Vec<TdxEvent> {
+    if is_tdx_measurement_config(config) {
+        strip_tdx_measurement_event_log(event_log)
+    } else {
+        strip_tdx_runtime_event_log(event_log)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data")]
 pub enum PlatformEvidence {
@@ -92,14 +142,14 @@ impl PlatformEvidence {
     }
 
     pub fn into_stripped(self) -> Self {
+        self.into_stripped_for_config("")
+    }
+
+    pub fn into_stripped_for_config(self, config: &str) -> Self {
         match self {
             Self::Tdx { quote, event_log } => Self::Tdx {
                 quote,
-                event_log: event_log
-                    .into_iter()
-                    .filter(|event| event.imr == 3)
-                    .map(|event| event.stripped())
-                    .collect(),
+                event_log: strip_tdx_event_log_for_config(event_log, config),
             },
             Self::GcpTdx {
                 quote,
@@ -107,11 +157,7 @@ impl PlatformEvidence {
                 tpm_quote,
             } => Self::GcpTdx {
                 quote,
-                event_log: event_log
-                    .into_iter()
-                    .filter(|event| event.imr == 3)
-                    .map(|event| event.stripped())
-                    .collect(),
+                event_log: strip_tdx_runtime_event_log(event_log),
                 tpm_quote,
             },
             other => other,
@@ -242,9 +288,10 @@ impl Attestation {
     }
 
     pub fn into_stripped(self) -> Self {
+        let config = self.stack.config().to_string();
         Self {
             version: self.version,
-            platform: self.platform.into_stripped(),
+            platform: self.platform.into_stripped_for_config(&config),
             stack: self.stack,
         }
     }
@@ -412,6 +459,69 @@ mod tests {
             decoded.platform.sev_snp_cert_chain(),
             Some(vec![vec![0x22, 0x33]].as_slice())
         );
+    }
+
+    fn boot_event(idx: usize) -> TdxEvent {
+        TdxEvent {
+            imr: 0,
+            event_type: idx as u32,
+            digest: vec![idx as u8; 48],
+            event: String::new(),
+            event_payload: vec![0xff; idx + 1],
+        }
+    }
+
+    fn runtime_event() -> TdxEvent {
+        RuntimeEvent {
+            event: "app-id".into(),
+            payload: vec![0x42],
+        }
+        .into()
+    }
+
+    #[test]
+    fn measurement_stripping_keeps_only_pre202505_acpi_digests_and_runtime_payloads() {
+        let mut event_log = (0..13).map(boot_event).collect::<Vec<_>>();
+        event_log.push(runtime_event());
+
+        let stripped = strip_tdx_measurement_event_log(event_log);
+
+        assert_eq!(stripped.len(), 4);
+        assert_eq!(
+            stripped[0..3]
+                .iter()
+                .map(|event| event.digest.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![8u8; 48], vec![9u8; 48], vec![10u8; 48]]
+        );
+        assert!(stripped[0..3]
+            .iter()
+            .all(|event| event.imr == 0 && event.event_payload.is_empty()));
+        assert_eq!(stripped[3].imr, 3);
+        assert_eq!(stripped[3].event, "app-id");
+        assert_eq!(stripped[3].event_payload, vec![0x42]);
+    }
+
+    #[test]
+    fn measurement_stripping_keeps_only_stable202505_acpi_digests_and_runtime_payloads() {
+        let mut event_log = (0..17).map(boot_event).collect::<Vec<_>>();
+        event_log.push(runtime_event());
+
+        let stripped = strip_tdx_measurement_event_log(event_log);
+
+        assert_eq!(stripped.len(), 4);
+        assert_eq!(
+            stripped[0..3]
+                .iter()
+                .map(|event| event.digest.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![10u8; 48], vec![11u8; 48], vec![12u8; 48]]
+        );
+        assert!(stripped[0..3]
+            .iter()
+            .all(|event| event.imr == 0 && event.event_payload.is_empty()));
+        assert_eq!(stripped[3].imr, 3);
+        assert_eq!(stripped[3].event_payload, vec![0x42]);
     }
 
     #[test]

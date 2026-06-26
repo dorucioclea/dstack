@@ -10,7 +10,9 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use cc_eventlog::TdxEvent;
-use dstack_mr::{RtmrLog, TdxMeasurementDetails, TdxMeasurements};
+use dstack_mr::{
+    tdx::TdxRtmr0AcpiHashes, RtmrLog, RtmrLogs, TdxMeasurementDetails, TdxMeasurements,
+};
 use dstack_types::VmConfig;
 use hex_literal::hex;
 use ra_tls::attestation::{
@@ -149,6 +151,7 @@ struct CachedMeasurement {
 }
 
 struct ImagePaths {
+    image_dir: PathBuf,
     fw_path: PathBuf,
     kernel_path: PathBuf,
     initrd_path: PathBuf,
@@ -359,6 +362,68 @@ impl CvmVerifier {
         Ok(measurements)
     }
 
+    fn image_content_digest(image_dir: &Path) -> Result<Option<Vec<u8>>> {
+        let sha256sum_path = image_dir.join("sha256sum.txt");
+        if !sha256sum_path.exists() {
+            return Ok(None);
+        }
+        let files_doc =
+            fs_err::read_to_string(&sha256sum_path).context("Failed to read sha256sum.txt")?;
+        Ok(Some(
+            Sha256::new_with_prefix(files_doc.as_bytes())
+                .finalize()
+                .to_vec(),
+        ))
+    }
+
+    fn image_hash_matches_legacy_digest(image_dir: &Path, expected: &[u8]) -> Result<bool> {
+        Ok(Self::image_content_digest(image_dir)?
+            .as_deref()
+            .is_some_and(|digest| digest == expected))
+    }
+
+    fn tdx_acpi_hashes_from_event_log(
+        ovmf_variant: dstack_types::OvmfVariant,
+        event_log: &[TdxEvent],
+    ) -> Result<TdxRtmr0AcpiHashes> {
+        let rtmr0_events = event_log
+            .iter()
+            .filter(|event| event.imr == 0)
+            .collect::<Vec<_>>();
+        let (loader_idx, rsdp_idx, tables_idx) = match ovmf_variant {
+            dstack_types::OvmfVariant::Pre202505 => (8, 9, 10),
+            dstack_types::OvmfVariant::Stable202505 => (10, 11, 12),
+        };
+        let (loader_idx, rsdp_idx, tables_idx) = if rtmr0_events.len() == 3 {
+            (0, 1, 2)
+        } else {
+            (loader_idx, rsdp_idx, tables_idx)
+        };
+        let get_digest = |idx: usize, label: &str| -> Result<Vec<u8>> {
+            let event = rtmr0_events.get(idx).with_context(|| {
+                format!(
+                    "TDX RTMR0 event log is missing {label} event at index {idx} \
+                     for {:?} OVMF; found {} RTMR0 events",
+                    ovmf_variant,
+                    rtmr0_events.len()
+                )
+            })?;
+            let digest = event.digest();
+            if digest.len() != 48 {
+                bail!(
+                    "TDX RTMR0 {label} event digest has invalid length {}, expected 48",
+                    digest.len()
+                );
+            }
+            Ok(digest)
+        };
+        Ok(TdxRtmr0AcpiHashes {
+            loader: get_digest(loader_idx, "ACPI loader")?,
+            rsdp: get_digest(rsdp_idx, "ACPI RSDP")?,
+            tables: get_digest(tables_idx, "ACPI tables")?,
+        })
+    }
+
     /// Helper method to ensure image is downloaded and return image paths
     async fn ensure_image_downloaded(&self, vm_config: &VmConfig) -> Result<ImagePaths> {
         let hex_os_image_hash = hex::encode(&vm_config.os_image_hash);
@@ -391,6 +456,7 @@ impl CvmVerifier {
         let kernel_cmdline = image_info.cmdline + " initrd=initrd";
 
         Ok(ImagePaths {
+            image_dir,
             fw_path,
             kernel_path,
             initrd_path,
@@ -526,8 +592,23 @@ impl CvmVerifier {
                     .await?;
             }
             AttestationQuote::DstackTdx(_) => {
-                self.verify_os_image_hash_for_dstack_tdx(&vm_config, attestation, debug, details)
+                if vm_config.tdx_attestation_variant.is_measurement() {
+                    self.verify_os_image_hash_for_dstack_tdx_measurement(
+                        &vm_config,
+                        attestation,
+                        debug,
+                        details,
+                    )
                     .await?;
+                } else {
+                    self.verify_os_image_hash_for_dstack_tdx(
+                        &vm_config,
+                        attestation,
+                        debug,
+                        details,
+                    )
+                    .await?;
+                }
             }
             AttestationQuote::DstackNitroEnclave(_) => {
                 let DstackVerifiedReport::DstackNitroEnclave(report) = &attestation.report else {
@@ -596,13 +677,11 @@ impl CvmVerifier {
             bail!("No TDX quote");
         };
         let event_log = &tdx_quote.event_log;
-        // Get boot info from attestation
         let report = report
             .report
             .as_td10()
             .context("Failed to decode TD report")?;
 
-        // Extract the verified MRs from the report
         let verified_mrs = Mrs {
             mrtd: report.mr_td.to_vec(),
             rtmr0: report.rt_mr0.to_vec(),
@@ -610,16 +689,21 @@ impl CvmVerifier {
             rtmr2: report.rt_mr2.to_vec(),
         };
 
-        // one download serves both measurement computation and the dev/version flags
+        // Legacy TDX attestation keeps the original KMS verifier semantics:
+        // os_image_hash must be the image content digest, and expected MRs are
+        // recomputed through the existing full-image path.
         let image_paths = self.ensure_image_downloaded(vm_config).await?;
+        if !Self::image_hash_matches_legacy_digest(&image_paths.image_dir, &vm_config.os_image_hash)
+            .context("Failed to check legacy image digest")?
+        {
+            bail!("legacy TDX attestation requires the digest.txt os_image_hash");
+        }
         details.os_image_is_dev = Some(image_paths.is_dev);
         if !image_paths.version.is_empty() {
             details.os_image_version = Some(image_paths.version.clone());
         }
 
-        // Compute expected measurements
         let (mrs, expected_logs) = if debug {
-            // For debug mode, we need detailed logs and ACPI tables
             let TdxMeasurementDetails {
                 measurements,
                 rtmr_logs,
@@ -642,7 +726,6 @@ impl CvmVerifier {
 
             (measurements, Some(rtmr_logs))
         } else {
-            // For non-debug mode, use the cached-measurement path.
             (
                 self.load_or_compute_measurements(
                     vm_config,
@@ -655,6 +738,100 @@ impl CvmVerifier {
                 None,
             )
         };
+
+        self.compare_tdx_mrs(
+            Mrs {
+                mrtd: mrs.mrtd,
+                rtmr0: mrs.rtmr0,
+                rtmr1: mrs.rtmr1,
+                rtmr2: mrs.rtmr2,
+            },
+            verified_mrs,
+            expected_logs.as_ref(),
+            event_log,
+            debug,
+            details,
+        )
+    }
+
+    async fn verify_os_image_hash_for_dstack_tdx_measurement(
+        &self,
+        vm_config: &VmConfig,
+        attestation: &VerifiedAttestation,
+        debug: bool,
+        _details: &mut VerificationDetails,
+    ) -> Result<()> {
+        let Some(report) = &attestation.report.tdx_report() else {
+            bail!("No TDX report");
+        };
+        let Some(tdx_quote) = attestation.tdx_quote() else {
+            bail!("No TDX quote");
+        };
+        let event_log = &tdx_quote.event_log;
+        // Get boot info from attestation
+        let report = report
+            .report
+            .as_td10()
+            .context("Failed to decode TD report")?;
+
+        // Extract the verified MRs from the report
+        let verified_mrs = Mrs {
+            mrtd: report.mr_td.to_vec(),
+            rtmr0: report.rt_mr0.to_vec(),
+            rtmr1: report.rt_mr1.to_vec(),
+            rtmr2: report.rt_mr2.to_vec(),
+        };
+
+        let document = vm_config
+            .tdx_measurement
+            .as_ref()
+            .context("tdx measurement attestation requires vm_config.tdx_measurement")?;
+        let document_hash = hex::decode(&document.os_image_hash)
+            .context("vm_config.tdx_measurement.os_image_hash is not valid hex")?;
+        if document_hash != vm_config.os_image_hash {
+            bail!(
+                "tdx measurement os_image_hash mismatch: vm_config={}, document={}",
+                hex::encode(&vm_config.os_image_hash),
+                document.os_image_hash
+            );
+        }
+        let computed_hash = document.measurement_os_image_hash();
+        if computed_hash.as_slice() != vm_config.os_image_hash {
+            bail!(
+                "tdx measurement document hash mismatch: vm_config={}, computed={}",
+                hex::encode(&vm_config.os_image_hash),
+                hex::encode(computed_hash)
+            );
+        }
+        let measurement = document
+            .decode_measurement()
+            .map_err(anyhow::Error::msg)
+            .context("failed to decode vm_config.tdx_measurement CBOR")?;
+        if let Some(config_ovmf_variant) = vm_config.ovmf_variant {
+            if config_ovmf_variant != measurement.tdvf.ovmf_variant {
+                bail!(
+                    "tdx measurement ovmf_variant mismatch: vm_config={:?}, document={:?}",
+                    config_ovmf_variant,
+                    measurement.tdvf.ovmf_variant
+                );
+            }
+        }
+
+        // Compute expected measurements. New TDX images advertise the
+        // measurement.json-derived TDX os_image_hash; verify those without
+        // downloading the image or running QEMU-derived ACPI table generators.
+        // The stripped certificate carries just the three hardware-bound RTMR0
+        // ACPI digests (loader, RSDP, tables); every other RTMR0 digest is
+        // derived locally from vm_config + tdx_measurement.
+        let acpi_hashes =
+            Self::tdx_acpi_hashes_from_event_log(measurement.tdvf.ovmf_variant, event_log)
+                .context("TDX measurement attestation is missing RTMR0 ACPI table digests")?;
+        let mrs = dstack_mr::tdx::tdx_measurements_from_measurement_document(
+            document,
+            vm_config,
+            &acpi_hashes,
+        )
+        .context("Failed to compute TDX expected measurements without image download")?;
 
         let expected_mrs = Mrs {
             mrtd: mrs.mrtd.clone(),
@@ -670,7 +847,28 @@ impl CvmVerifier {
                 if !debug {
                     return result;
                 }
-                let Some(expected_logs) = expected_logs.as_ref() else {
+                result
+            }
+        }
+    }
+
+    fn compare_tdx_mrs(
+        &self,
+        expected_mrs: Mrs,
+        verified_mrs: Mrs,
+        expected_logs: Option<&RtmrLogs>,
+        event_log: &[TdxEvent],
+        debug: bool,
+        details: &mut VerificationDetails,
+    ) -> Result<()> {
+        match expected_mrs.assert_eq(&verified_mrs) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let result = Err(e).context("MRs do not match");
+                if !debug {
+                    return result;
+                }
+                let Some(expected_logs) = expected_logs else {
                     return result;
                 };
                 let mut rtmr_debug = Vec::new();
@@ -894,10 +1092,24 @@ impl CvmVerifier {
             }
         }
 
-        // os_image_hash should eq to sha256sum of the sha256sum.txt
-        let os_image_hash = Sha256::new_with_prefix(files_doc.as_bytes()).finalize();
-        if hex::encode(os_image_hash) != hex_os_image_hash {
-            bail!("os_image_hash does not match sha256sum of the sha256sum.txt");
+        // Legacy images use sha256(sha256sum.txt) as os_image_hash. Newer
+        // TDX/SNP images may instead be addressed by measurement.json-derived
+        // hashes, so accept those too after recomputing them from extracted
+        // image files.
+        let legacy_os_image_hash = Sha256::new_with_prefix(files_doc.as_bytes()).finalize();
+        let mut image_hash_matches = hex::encode(legacy_os_image_hash) == hex_os_image_hash;
+        if !image_hash_matches {
+            image_hash_matches = dstack_mr::tdx::tdx_os_image_hash_for_image_dir(&extracted_dir)
+                .map(|hash| hex::encode(hash) == hex_os_image_hash)
+                .unwrap_or(false)
+                || dstack_mr::sev::sev_os_image_hash_for_image_dir(&extracted_dir)
+                    .map(|hash| hex::encode(hash) == hex_os_image_hash)
+                    .unwrap_or(false);
+        }
+        if !image_hash_matches {
+            bail!(
+                "os_image_hash matches neither sha256sum.txt nor measurement.json-derived hashes"
+            );
         }
 
         // Move the extracted files to the destination directory
